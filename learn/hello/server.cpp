@@ -35,8 +35,8 @@ int main() {
     return 1;
   }
 
-  if (listen(fd, SOMAXCONN) <
-      0) { // SOMAXCONN is the maximum number of pending connections
+  if (listen(fd, SOMAXCONN) < 0) {
+    // SOMAXCONN is the maximum number of pending connections
     std::cout << "Error listening on socket" << std::endl;
     return 1;
   }
