@@ -35,72 +35,152 @@ public:
 
 using ConnectionPtr = std::shared_ptr<Connection>;
 
-namespace {
-namespace Internal {
-int set_up_fd();
-bool fd_set_nb(const int &fd);
-bool accept_new_conn(std::unordered_map<int, ConnectionPtr> &fd2Conn,
-                     const int &fd);
+class ServerImpl;
+class Server {
+public:
+  Server(const int port = 8080);
+  ~Server();
 
-bool connection_io(ConnectionPtr conn);
-bool state_request(ConnectionPtr conn);
-bool state_response(ConnectionPtr conn);
-bool try_fill_buffer(ConnectionPtr conn);
-bool try_flush_buffer(ConnectionPtr conn);
+  bool init();
+  bool start();
+  bool stop();
+  bool deinit();
 
-bool try_one_req(ConnectionPtr conn);
-} // namespace Internal
-} // namespace
+private:
+  std::unique_ptr<ServerImpl> impl_;
+};
 
 int main() {
-  int fd = Internal::set_up_fd();
-  std::unordered_map<int, ConnectionPtr> fd2Conn;
-  std::vector<pollfd> poll_args;
-  while (true) {
-    poll_args.clear(); // prepare the arg for the pool()
-    poll_args.push_back(
-        pollfd{fd, POLL_IN, 0}); // put the listening fd on the top
-    for (const auto &[conFD, conn] : fd2Conn) {
+  Server server(k_port);
+  server.init();
+  server.start();
+}
+
+namespace {
+namespace Internal {} // namespace Internal
+} // namespace
+//
+
+// Server private implementation
+class ServerImpl {
+public:
+  ServerImpl(const int &port);
+  ~ServerImpl();
+
+  bool init();
+  bool start();
+  bool stop();
+  bool deinit();
+
+private:
+  int setUpFD();
+  bool setFDNonBlocking(const int &fd);
+  bool acceptNewConn(std::unordered_map<int, ConnectionPtr> &fd2Conn,
+                     const int &fd);
+
+  bool connectionIO(ConnectionPtr conn);
+  bool stateRequest(ConnectionPtr conn);
+  bool stateResponse(ConnectionPtr conn);
+  bool tryFillBuffer(ConnectionPtr conn);
+  bool tryFlushBuffer(ConnectionPtr conn);
+
+  bool doRequest(ConnectionPtr conn);
+
+private:
+  int _port;
+  int _fd;
+  std::unordered_map<int, ConnectionPtr> _fd2Conn;
+  std::vector<pollfd> _pollArgs;
+
+  bool _stopped = false;
+};
+
+ServerImpl::~ServerImpl() {
+  if (_fd > 0) {
+    close(_fd);
+  }
+}
+
+Server::Server(const int port) { impl_ = std::make_unique<ServerImpl>(port); }
+
+Server::~Server() {
+  if (impl_) {
+    impl_->deinit();
+  }
+}
+
+bool Server::init() { return impl_->init(); }
+bool Server::start() { return impl_->start(); }
+bool Server::stop() { return impl_->stop(); }
+bool Server::deinit() { return impl_->deinit(); }
+
+ServerImpl::ServerImpl(const int &port) : _port(port), _fd(-1) {}
+
+bool ServerImpl::init() {
+  _fd = setUpFD();
+  if (_fd < 0) {
+    return false;
+  }
+  return true;
+}
+
+bool ServerImpl::start() {
+  while (!_stopped) {
+    _pollArgs.clear(); // prepare the arg for the pool()
+    _pollArgs.push_back(
+        pollfd{_fd, POLL_IN, 0}); // put the listening fd on the top
+    for (const auto &[conFD, conn] : _fd2Conn) {
       pollfd pfd = {};
       pfd.fd = conn->fd;
       pfd.events =
           ((conn->type == ConnectionType::REQUEST) ? POLL_IN : POLL_OUT) |
           POLL_ERR;
-      poll_args.push_back(pfd);
+      _pollArgs.push_back(pfd);
     }
 
-    if (int rc = poll(poll_args.data(), (nfds_t)(poll_args.size()), 1000);
+    if (int rc = poll(_pollArgs.data(), (nfds_t)(_pollArgs.size()), 1000);
         rc < 0) {
       std::cout << "Poll error, ec: " << rc;
     }
 
-    // std::cout << poll_args.size() << " fd in poll\n";
-    for (int i = 1; i < poll_args.size(); i++) {
+    for (int i = 1; i < _pollArgs.size(); i++) {
 
-      if (!poll_args[i].revents) {
-        std::cout << "No event on fd " << poll_args[i].fd << std::endl;
+      if (!_pollArgs[i].revents) {
+        std::cout << "No event on fd " << _pollArgs[i].fd << std::endl;
         continue;
       }
-      ConnectionPtr conn = fd2Conn[poll_args[i].fd];
-      Internal::connection_io(conn);
+      ConnectionPtr conn = _fd2Conn[_pollArgs[i].fd];
+      connectionIO(conn);
 
       if (conn->type == ConnectionType::END) {
         // Client destroy normally, or something bad happened
         // Destroy this connection
-        fd2Conn.erase(conn->fd);
+        _fd2Conn.erase(conn->fd);
         close(conn->fd);
       }
     }
     // Try to accept new connection if the listening fd is active
-    if (poll_args.front().revents) {
-      Internal::accept_new_conn(fd2Conn, fd);
+    if (_pollArgs.front().revents) {
+      acceptNewConn(_fd2Conn, _fd);
     }
   }
+
+  return true;
 }
 
-namespace {
-namespace Internal {
-int set_up_fd() {
+bool ServerImpl::stop() {
+  _stopped = true;
+  return true;
+}
+
+bool ServerImpl::deinit() {
+  if (_fd > 0) {
+    close(_fd);
+  }
+  return true;
+}
+
+int ServerImpl::setUpFD() {
   int fd = socket(AF_INET, SOCK_STREAM,
                   0); // SOCK_STREAM for TCP
   if (fd < 0) {
@@ -119,7 +199,7 @@ int set_up_fd() {
   }
 
   // Set the server fd to non-blocking mode
-  fd_set_nb(fd);
+  setFDNonBlocking(fd);
   std::cout << "Binding server on port " << k_port << ", fd " << fd
             << std::endl;
   if (listen(fd, SOMAXCONN) < 0) {
@@ -130,7 +210,7 @@ int set_up_fd() {
   return fd;
 }
 
-bool fd_set_nb(const int &fd) {
+bool ServerImpl::setFDNonBlocking(const int &fd) {
   int flags;
 
   // Get the current file descriptor flags
@@ -150,8 +230,8 @@ bool fd_set_nb(const int &fd) {
   return true;
 }
 
-bool accept_new_conn(std::unordered_map<int, ConnectionPtr> &fd2Conn,
-                     const int &fd) {
+bool ServerImpl::acceptNewConn(std::unordered_map<int, ConnectionPtr> &fd2Conn,
+                               const int &fd) {
   sockaddr_in client_addr{};
   socklen_t len = sizeof(client_addr);
   std::cout << "Waiting for new connection\n";
@@ -162,7 +242,7 @@ bool accept_new_conn(std::unordered_map<int, ConnectionPtr> &fd2Conn,
   }
 
   std::cout << "Accepted new connection from fd: " << connFD << std::endl;
-  if (!fd_set_nb(connFD)) {
+  if (!setFDNonBlocking(connFD)) {
     std::cout << "Can not set fd to non-blocking mode\n";
     return false;
   }
@@ -175,30 +255,30 @@ bool accept_new_conn(std::unordered_map<int, ConnectionPtr> &fd2Conn,
   return true;
 }
 
-bool connection_io(ConnectionPtr conn) {
+bool ServerImpl::connectionIO(ConnectionPtr conn) {
   if (conn->type == ConnectionType::REQUEST) {
-    return state_request(conn);
+    return stateRequest(conn);
   } else if (conn->type == ConnectionType::RESPOND) {
-    return state_response(conn);
+    return stateResponse(conn);
   }
   return true;
 }
 
-bool state_request(ConnectionPtr conn) {
+bool ServerImpl::stateRequest(ConnectionPtr conn) {
   // std::cout << "Request state from fd " << conn->fd << std::endl;
-  while (try_fill_buffer(conn)) {
+  while (tryFillBuffer(conn)) {
   }
   return true;
 }
 
-bool state_response(ConnectionPtr conn) {
+bool ServerImpl::stateResponse(ConnectionPtr conn) {
   // std::cout << "Response state from fd " << conn->fd << std::endl;
-  while (try_flush_buffer(conn)) {
+  while (tryFlushBuffer(conn)) {
   }
   return true;
 }
 
-bool try_fill_buffer(ConnectionPtr conn) {
+bool ServerImpl::tryFillBuffer(ConnectionPtr conn) {
   ssize_t rv = 0;
   do {
     size_t cap = sizeof(conn->rbuf) - conn->rbuf_size;
@@ -224,11 +304,11 @@ bool try_fill_buffer(ConnectionPtr conn) {
   // Because there are many request in a connection (to save latency from
   // client)
   // while (try_one_req(conn)) {}
-  try_one_req(conn);
+  doRequest(conn);
   return conn->type == ConnectionType::REQUEST;
 }
 
-bool try_one_req(ConnectionPtr conn) {
+bool ServerImpl::doRequest(ConnectionPtr conn) {
   if (sizeof(conn->rbuf) < 4)
     return false;
   size_t len = 0;
@@ -257,12 +337,12 @@ bool try_one_req(ConnectionPtr conn) {
   conn->wbuf_size = size + 4;
   conn->wbuf_sent = 0;
 
-  state_response(conn);
+  stateResponse(conn);
 
   return conn->type == ConnectionType::REQUEST;
 }
 
-bool try_flush_buffer(ConnectionPtr conn) {
+bool ServerImpl::tryFlushBuffer(ConnectionPtr conn) {
   ssize_t rv = 0;
   auto remain = conn->wbuf_size - conn->wbuf_sent;
   rv = write(conn->fd, &conn->wbuf[conn->wbuf_sent], remain);
@@ -286,6 +366,3 @@ bool try_flush_buffer(ConnectionPtr conn) {
   }
   return true;
 }
-
-} // namespace Internal
-} // namespace
